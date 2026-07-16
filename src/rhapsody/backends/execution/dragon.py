@@ -14,6 +14,7 @@ DRAGON_BATCH_INIT_ERROR = None
 
 try:
     import dragon
+    from dragon.infrastructure.facts import PMIBackend
     from dragon.infrastructure.policy import Policy
     from dragon.native.process import ProcessTemplate
     from dragon.workflows.batch import Batch
@@ -23,6 +24,7 @@ try:
 
 except ImportError as e:  # pragma: no cover - environment without Dragon
     dragon = None
+    PMIBackend = None
     ProcessTemplate = None
     Policy = None
     Batch = None
@@ -39,6 +41,42 @@ def _get_logger() -> logging.Logger:
     configured logging, not at module import time.
     """
     return logging.getLogger(__name__)
+
+
+def _resolve_pmi_backend(pmi: Any) -> Any:
+    """Normalize user-provided PMI setting for Dragon Batch jobs.
+
+    Accepts:
+    - ``None`` to disable PMI
+    - ``PMIBackend`` values
+    - strings like ``"cray"`` or ``"pmix"`` (case-insensitive)
+    """
+    if pmi is None:
+        return None
+
+    # If Dragon isn't importable here, return the value untouched; Batch-side
+    # validation will raise if invalid.
+    if PMIBackend is None:
+        return pmi
+
+    if isinstance(pmi, PMIBackend):
+        return pmi
+
+    if isinstance(pmi, str):
+        normalized = pmi.strip().lower()
+        if normalized == "none":
+            return None
+        try:
+            return PMIBackend.from_str(normalized)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid Dragon PMI backend '{pmi}'. Expected one of: 'cray', 'pmix', or None."
+            ) from e
+
+    raise ValueError(
+        f"Invalid Dragon PMI backend type {type(pmi).__name__}. "
+        "Expected str, PMIBackend, or None."
+    )
 
 
 # ============================================================================
@@ -362,6 +400,8 @@ class DragonExecutionBackend(BaseBackend):
         # Get template configs once
         process_templates_config = backend_kwargs.get("process_templates")
         process_template_config = backend_kwargs.get("process_template")
+        pmi = _resolve_pmi_backend(backend_kwargs["pmi"]) if "pmi" in backend_kwargs else None
+        has_pmi_override = "pmi" in backend_kwargs
 
         # Compute per-task stdio paths when capture is requested.
         # Dragon creates parent directories automatically.
@@ -382,10 +422,16 @@ class DragonExecutionBackend(BaseBackend):
                 (nranks, ProcessTemplate(target, **_build_process_template_kwargs(tc)))
                 for nranks, tc in process_templates_config
             ]
-            batch_task = self.batch.job(
-                process_templates, name=name, timeout=timeout,
-                stdout=stdout_path, stderr=stderr_path,
-            )
+            job_kwargs = {
+                "name": name,
+                "timeout": timeout,
+                "stdout": stdout_path,
+                "stderr": stderr_path,
+            }
+            if has_pmi_override:
+                job_kwargs["pmi"] = pmi
+
+            batch_task = self.batch.job(process_templates, **job_kwargs)
             execution_mode = "job"
 
         elif process_template_config is not None:
@@ -399,6 +445,15 @@ class DragonExecutionBackend(BaseBackend):
 
         elif backend_kwargs.get("type") == "mpi":
             # Priority 3: Job auto-build
+            job_kwargs = {
+                "name": name,
+                "timeout": timeout,
+                "stdout": stdout_path,
+                "stderr": stderr_path,
+            }
+            if has_pmi_override:
+                job_kwargs["pmi"] = pmi
+
             batch_task = self.batch.job(
                 [
                     (
@@ -406,8 +461,7 @@ class DragonExecutionBackend(BaseBackend):
                         ProcessTemplate(target, **_build_process_template_kwargs({})),
                     )
                 ],
-                name=name, timeout=timeout,
-                stdout=stdout_path, stderr=stderr_path,
+                **job_kwargs,
             )
             execution_mode = "job"
 
